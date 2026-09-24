@@ -1,3 +1,17 @@
+//! Generatore di griglie cifrate con il metodo di Fleissner (griglia rotante).
+//!
+//! Il programma chiede una dimensione pari `n >= 4` e un messaggio, costruisce
+//! una maschera casuale di `n²/4` fori che, ruotata 4 volte di 90° in senso
+//! orario, copre ogni cella esattamente una volta, e scrive il messaggio nella
+//! griglia attraverso i fori. Produce:
+//!
+//! - a terminale: griglia cifrata, maschera e istruzioni di decifratura;
+//! - `fleissner_<n>_<slug>.svg`: la griglia inserita nel template grafico
+//!   `assets/template.svg` al posto del marcatore `<!--FLEISSNER_GRID-->`;
+//! - `database.json`: storico cumulativo delle esecuzioni (vedi [`HistoryEntry`]).
+//!
+//! Dettagli su algoritmo, geometria e limitazioni: `docs/ARCHITETTURA.md`.
+
 use rand::seq::SliceRandom;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -6,19 +20,35 @@ use std::fs;
 use std::io::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Storico delle esecuzioni, relativo alla directory corrente.
 const HISTORY_PATH: &str = "database.json";
 
+/// Una riga di `database.json`. Il testo in chiaro non viene salvato, ma
+/// `ciphertext` + `mask` bastano a ricostruirlo: il file va trattato come segreto.
 #[derive(Serialize, Deserialize)]
 struct HistoryEntry {
+    /// Secondi Unix al momento della generazione.
     timestamp: u64,
+    /// Lato della griglia (`n`).
     size: usize,
+    /// Caratteri non-spazio del messaggio originale, *prima* del troncamento
+    /// a `n²`: può superare `size * size`.
     message_len: usize,
+    /// Griglia letta per righe, dall'alto a sinistra: `n²` caratteri.
     ciphertext: String,
+    /// Fori della maschera in posizione iniziale (rotazione 0°), come
+    /// `(riga, colonna)` con origine 0 in alto a sinistra.
     mask: Vec<(usize, usize)>,
+    /// Nome del file SVG generato.
     svg_file: String,
 }
 
 /// Legge lo storico esistente (se presente), aggiunge l'entry e riscrive il file.
+///
+/// Se `database.json` manca, non è leggibile o non è deserializzabile come
+/// `Vec<HistoryEntry>` (JSON invalido o schema diverso, es. dopo una modifica
+/// della struct), viene trattato come vuoto e **sovrascritto**: lo storico
+/// precedente va perso.
 fn append_history(entry: HistoryEntry) -> io::Result<()> {
     let mut history: Vec<HistoryEntry> = fs::read_to_string(HISTORY_PATH)
         .ok()
@@ -31,14 +61,28 @@ fn append_history(entry: HistoryEntry) -> io::Result<()> {
     fs::write(HISTORY_PATH, json)
 }
 
+/// Griglia cifrata con la sua maschera.
 struct Fleissner {
+    /// Lato della griglia; pari e `>= 4` (verificato in `main`).
     size: usize,
+    /// `grid[riga][colonna]`, completamente riempita.
     grid: Vec<Vec<char>>,
+    /// `size²/4` fori in posizione iniziale; ruotandoli 4 volte di 90° in
+    /// senso orario ogni cella viene coperta esattamente una volta.
     mask: Vec<(usize, usize)>,
 }
 
 impl Fleissner {
     /// Crea una nuova griglia basata sulla dimensione e sul messaggio forniti dall'utente.
+    ///
+    /// Il messaggio viene privato degli spazi e convertito con
+    /// `to_ascii_uppercase` (le lettere non ASCII restano invariate). Se è più
+    /// corto di `size²` viene completato con lettere casuali `A..=Z`; se è più
+    /// lungo viene troncato senza avviso. Maschera e riempimento usano
+    /// `rand::thread_rng()`: due esecuzioni non sono riproducibili.
+    ///
+    /// Richiede `size` pari: con `size` dispari la cella centrale non ha orbita
+    /// e il ciclo sul quadrante lascerebbe vuote riga e colonna centrali.
     fn new(size: usize, message: &str) -> Self {
         let mut rng = rand::thread_rng();
         let total_cells = size * size;
@@ -129,7 +173,10 @@ impl Fleissner {
 
 }
 
+/// Template grafico, relativo alla directory corrente: il programma va
+/// eseguito dalla root del repository.
 const TEMPLATE_PATH: &str = "assets/template.svg";
+/// Commento nel template sostituito dal gruppo `<g id="fleissner-grid">`.
 const GRID_MARKER: &str = "<!--FLEISSNER_GRID-->";
 
 // Geometria ricavata componendo le matrici Affinity del template originale
@@ -234,4 +281,95 @@ fn main() {
     };
     append_history(entry).expect("impossibile aggiornare database.json");
     println!("Storico aggiornato in {}", HISTORY_PATH);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rotazione oraria di 90°, identica a quella usata in `Fleissner::new`.
+    fn ruota(p: (usize, usize), size: usize) -> (usize, usize) {
+        (p.1, size - 1 - p.0)
+    }
+
+    /// Procedura di decifratura descritta in docs/ARCHITETTURA.md:
+    /// per ognuna delle 4 rotazioni, leggi i fori in ordine riga-colonna.
+    fn decifra(f: &Fleissner) -> String {
+        let mut out = String::new();
+        let mut cur = f.mask.clone();
+        for _ in 0..4 {
+            cur.sort();
+            for &(r, c) in &cur {
+                out.push(f.grid[r][c]);
+            }
+            cur = cur.iter().map(|&p| ruota(p, f.size)).collect();
+        }
+        out
+    }
+
+    #[test]
+    fn maschera_copre_ogni_cella_una_volta_in_quattro_rotazioni() {
+        for size in [4, 6, 8, 10] {
+            let f = Fleissner::new(size, "");
+            assert_eq!(f.mask.len(), size * size / 4);
+            let mut visti = vec![vec![0u8; size]; size];
+            let mut cur = f.mask.clone();
+            for _ in 0..4 {
+                for &(r, c) in &cur {
+                    visti[r][c] += 1;
+                }
+                cur = cur.iter().map(|&p| ruota(p, size)).collect();
+            }
+            assert!(visti.iter().flatten().all(|&n| n == 1), "size {size}");
+        }
+    }
+
+    #[test]
+    fn decifratura_documentata_restituisce_il_messaggio() {
+        // Messaggio da n² caratteri: attraversa tutte e 4 le rotazioni.
+        let pieno = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        assert_eq!(decifra(&Fleissner::new(6, pieno)), pieno);
+
+        let f = Fleissner::new(6, "ciao mondo");
+        let chiaro = decifra(&f);
+        assert_eq!(chiaro.len(), 36);
+        assert!(chiaro.starts_with("CIAOMONDO"));
+        assert!(chiaro[9..].chars().all(|c| c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn messaggio_troppo_lungo_viene_troncato() {
+        let msg = "A".repeat(10) + &"B".repeat(10); // 20 caratteri, griglia da 16
+        let f = Fleissner::new(4, &msg);
+        assert_eq!(decifra(&f), "A".repeat(10) + &"B".repeat(6));
+    }
+
+    #[test]
+    fn caratteri_non_ascii_non_vengono_convertiti() {
+        let f = Fleissner::new(4, "è");
+        assert!(decifra(&f).starts_with('è'));
+    }
+
+    #[test]
+    fn markup_ha_una_cella_per_posizione() {
+        let f = Fleissner::new(8, "test");
+        let m = generate_grid_markup(&f);
+        assert_eq!(m.matches("<rect ").count(), 64);
+        assert_eq!(m.matches("<text ").count(), 64);
+    }
+
+    #[test]
+    fn template_contiene_il_marcatore_una_volta() {
+        let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), TEMPLATE_PATH);
+        let t = fs::read_to_string(path).unwrap();
+        assert_eq!(t.matches(GRID_MARKER).count(), 1);
+    }
+
+    #[test]
+    #[ignore = "limitazione nota: caratteri XML non escapati, vedi docs/ARCHITETTURA.md"]
+    fn caratteri_xml_vengono_escapati() {
+        let f = Fleissner::new(4, "<&");
+        let m = generate_grid_markup(&f);
+        assert!(!m.contains("><</text>") && !m.contains(">&</text>"));
+    }
 }
